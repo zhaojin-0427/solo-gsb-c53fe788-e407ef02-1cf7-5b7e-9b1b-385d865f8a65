@@ -1,0 +1,85 @@
+{
+  "idempotency_key": "selfjoin-total-7-padded",
+  "tables": [
+    {
+      "table": "ledger",
+      "primary_key": ["id"],
+      "columns": [
+        {"name": "id", "type": "int"},
+        {"name": "k", "type": "int"},
+        {"name": "amount", "type": "int"}
+      ],
+      "rows": [
+        {"id": 1, "k": 1, "amount": 0},
+        {"id": 2, "k": 1, "amount": 5},
+        {"id": 3, "k": 1, "amount": -5},
+        {"id": 4, "k": 2, "amount": 7},
+        {"id": 5, "k": 5, "amount": 0},
+        {"id": 6, "k": 6, "amount": 0},
+        {"id": 7, "k": 7, "amount": 0},
+        {"id": 8, "k": 8, "amount": 0},
+        {"id": 9, "k": 9, "amount": 0},
+        {"id": 10, "k": 10, "amount": 0},
+        {"id": 11, "k": 11, "amount": 0},
+        {"id": 12, "k": 12, "amount": 0},
+        {"id": 13, "k": 13, "amount": 0},
+        {"id": 14, "k": 14, "amount": 0},
+        {"id": 15, "k": 15, "amount": 0},
+        {"id": 16, "k": 16, "amount": 0},
+        {"id": 17, "k": 17, "amount": 0},
+        {"id": 18, "k": 18, "amount": 0},
+        {"id": 19, "k": 19, "amount": 0},
+        {"id": 20, "k": 20, "amount": 0},
+        {"id": 21, "k": 21, "amount": 0},
+        {"id": 22, "k": 22, "amount": 0}
+      ]
+    }
+  ],
+  "plan": {
+    "type": "aggregate",
+    "input": {
+      "type": "project",
+      "columns": [{"from": "right.amount", "as": "amt"}],
+      "input": {
+        "type": "filter",
+        "predicate": {
+          "or": [
+            {
+              "and": [
+                {"column": "id", "op": "=", "value": 1},
+                {"column": "right.id", "op": ">=", "value": 2}
+              ]
+            },
+            {"column": "id", "op": "=", "value": 4},
+            {"column": "id", "op": "=", "value": 5},
+            {"column": "id", "op": "=", "value": 6},
+            {"column": "id", "op": "=", "value": 7},
+            {"column": "id", "op": "=", "value": 8},
+            {"column": "id", "op": "=", "value": 9},
+            {"column": "id", "op": "=", "value": 10},
+            {"column": "id", "op": "=", "value": 11},
+            {"column": "id", "op": "=", "value": 12},
+            {"column": "id", "op": "=", "value": 13},
+            {"column": "id", "op": "=", "value": 14},
+            {"column": "id", "op": "=", "value": 15},
+            {"column": "id", "op": "=", "value": 16},
+            {"column": "id", "op": "=", "value": 17},
+            {"column": "id", "op": "=", "value": 18},
+            {"column": "id", "op": "=", "value": 19},
+            {"column": "id", "op": "=", "value": 20},
+            {"column": "id", "op": "=", "value": 21},
+            {"column": "id", "op": "=", "value": 22}
+          ]
+        },
+        "input": {
+          "type": "join",
+          "left": {"type": "scan", "table": "ledger"},
+          "right": {"type": "scan", "table": "ledger"},
+          "on": [{"left": "k", "right": "k"}]
+        }
+      }
+    },
+    "aggregates": [{"fn": "sum", "column": "amt", "as": "total"}]
+  },
+  "explain": {"row": {"total": 7}}
+}

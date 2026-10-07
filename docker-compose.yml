@@ -1,0 +1,13 @@
+services:
+  provenance-api:
+    build: .
+    image: relation-provenance-api:1.0.0
+    container_name: relation-provenance-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - provenance-data:/data
+    restart: unless-stopped
+
+volumes:
+  provenance-data:
