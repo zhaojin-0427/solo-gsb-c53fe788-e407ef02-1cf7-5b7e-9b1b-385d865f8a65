@@ -1,0 +1,31 @@
+{
+  "idempotency_key": "projected-groups-total-5",
+  "tables": [
+    {
+      "table": "orders",
+      "primary_key": ["oid"],
+      "columns": [
+        {"name": "oid", "type": "int"},
+        {"name": "grp", "type": "string"},
+        {"name": "amount", "type": "int"}
+      ],
+      "rows": [
+        {"oid": 1, "grp": "A", "amount": 5},
+        {"oid": 2, "grp": "A", "amount": 2},
+        {"oid": 3, "grp": "A", "amount": -2},
+        {"oid": 4, "grp": "B", "amount": 5}
+      ]
+    }
+  ],
+  "plan": {
+    "type": "project",
+    "columns": [{"from": "total", "as": "total"}],
+    "input": {
+      "type": "aggregate",
+      "input": {"type": "scan", "table": "orders"},
+      "group_by": ["grp"],
+      "aggregates": [{"fn": "sum", "column": "amount", "as": "total"}]
+    }
+  },
+  "explain": {"row": {"total": 5}}
+}

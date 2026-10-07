@@ -1115,6 +1115,250 @@ def test_counterfactual_recompute_empty_aggregate(client):
     assert sc["recompute_error"]["code"] == "EMPTY_AGGREGATE"
 
 
+def test_projected_merged_groups_counterfactual(client):
+    """Regression for the projection-merging false negative.
+
+    Group A has amounts 5, 2, -2 (mixed signs, total 5) and group B has
+    amount 5 (total 5). Projecting away the group key merges both aggregate
+    rows into one output row ``{"total": 5}``; its witnesses are the union of
+    the groups' witnesses (s1 from A, s2 from B). The evaluator cannot
+    reverse the target's group key from the projected row, so the old
+    key-walking analysis gave up and fell back to hitting sets, reporting
+    only {orders[1], orders[4]}. Deleting orders[2] (or orders[3]) together
+    with orders[4] and recomputing the WHOLE plan removes the merged target
+    just as well (A becomes total 3 / 7 while B vanishes): the answer must
+    be the three label-sorted two-row sets, each with a recomputed scenario.
+    """
+    req = {
+        "idempotency_key": "key-projected-merged-groups",
+        "tables": [
+            {
+                "table": "orders",
+                "primary_key": ["oid"],
+                "columns": [
+                    {"name": "oid", "type": "int"},
+                    {"name": "grp", "type": "string"},
+                    {"name": "amount", "type": "int"},
+                ],
+                "rows": [
+                    {"oid": 1, "grp": "A", "amount": 5},
+                    {"oid": 2, "grp": "A", "amount": 2},
+                    {"oid": 3, "grp": "A", "amount": -2},
+                    {"oid": 4, "grp": "B", "amount": 5},
+                ],
+            }
+        ],
+        "plan": {
+            "type": "project",
+            "columns": [{"from": "total", "as": "total"}],
+            "input": {
+                "type": "aggregate",
+                "input": {"type": "scan", "table": "orders"},
+                "group_by": ["grp"],
+                "aggregates": [{"fn": "sum", "column": "amount", "as": "total"}],
+            },
+        },
+        "explain": {"row": {"total": 5}},
+    }
+    r1 = client.post("/query", json=req)
+    assert r1.status_code == 200, r1.text
+    body = r1.json()
+    # The two aggregate groups merged into one projected output row.
+    assert body["result"]["row_count"] == 1
+    assert body["result"]["rows"][0]["row"] == {"total": 5}
+    # Provenance of the merged row: orders[1] (A's 5) or orders[4] (B's 5).
+    assert body["result"]["rows"][0]["provenance"]["labels_structured"] == [
+        ["orders[1]"],
+        ["orders[4]"],
+    ]
+    cf = body["counterfactual"]
+    assert cf["target"] == {"total": 5}
+    assert cf["minimal_deletion_count"] == 3
+    assert cf["minimal_deletion_sets"] == [
+        ["orders[1]", "orders[4]"],
+        ["orders[2]", "orders[4]"],
+        ["orders[3]", "orders[4]"],
+    ]
+    by_delete = {tuple(sc["delete"]): sc for sc in cf["scenarios"]}
+    # Whole-plan recomputation adjudicates each set on the full result.
+    assert by_delete[("orders[1]", "orders[4]")]["result"]["rows"] == [
+        {"total": 0}
+    ]
+    assert by_delete[("orders[2]", "orders[4]")]["result"]["rows"] == [
+        {"total": 3}
+    ]
+    assert by_delete[("orders[3]", "orders[4]")]["result"]["rows"] == [
+        {"total": 7}
+    ]
+    for sc in cf["scenarios"]:
+        assert sc["target_present"] is False
+    # No singleton kills the merged target row: A alone survives as total 5
+    # when only orders[4] is deleted, and B alone survives when only one A
+    # row is deleted.
+    # Idempotent replay stays byte-identical.
+    r2 = client.post("/query", json=req)
+    assert r2.status_code == 200
+    assert r1.content == r2.content
+    assert r2.headers["x-idempotent-replay"] == "true"
+
+
+def test_projected_merged_groups_unrelated_mixed_group_no_422(client):
+    """An unrelated group sharing no witness label with the target's origin
+    groups (an ordinary scan input: every group has disjoint labels) must
+    never enter the candidate pool — even when that group is itself a
+    21-member mixed-sign sum that would exceed the pool cap on its own."""
+    rows = [
+        {"oid": 1, "grp": "A", "amount": 5},
+        {"oid": 2, "grp": "A", "amount": 2},
+        {"oid": 3, "grp": "A", "amount": -2},
+        {"oid": 4, "grp": "B", "amount": 5},
+    ]
+    rows += [
+        {"oid": oid, "grp": "C", "amount": 1} for oid in range(5, 25)
+    ] + [{"oid": 25, "grp": "C", "amount": -1}]
+    req = {
+        "idempotency_key": "key-projected-merged-unrelated",
+        "tables": [
+            {
+                "table": "orders",
+                "primary_key": ["oid"],
+                "columns": [
+                    {"name": "oid", "type": "int"},
+                    {"name": "grp", "type": "string"},
+                    {"name": "amount", "type": "int"},
+                ],
+                "rows": rows,
+            }
+        ],
+        "plan": {
+            "type": "project",
+            "columns": [{"from": "total", "as": "total"}],
+            "input": {
+                "type": "aggregate",
+                "input": {"type": "scan", "table": "orders"},
+                "group_by": ["grp"],
+                "aggregates": [{"fn": "sum", "column": "amount", "as": "total"}],
+            },
+        },
+        "explain": {"row": {"total": 5}},
+    }
+    r = client.post("/query", json=req)
+    assert r.status_code == 200, r.text
+    cf = r.json()["counterfactual"]
+    assert cf["minimal_deletion_sets"] == [
+        ["orders[1]", "orders[4]"],
+        ["orders[2]", "orders[4]"],
+        ["orders[3]", "orders[4]"],
+    ]
+    for sc in cf["scenarios"]:
+        assert sc["target_present"] is False
+
+
+def test_projected_merged_groups_null_group_key(client):
+    """The NULL group key forms its own group; when it also totals 5 its row
+    merges with A and B after the key is projected away. All three origins
+    must be removed, giving the 3x2 minimal three-row sets."""
+    req = {
+        "idempotency_key": "key-projected-merged-null",
+        "tables": [
+            {
+                "table": "orders",
+                "primary_key": ["oid"],
+                "columns": [
+                    {"name": "oid", "type": "int"},
+                    {"name": "grp", "type": "string"},
+                    {"name": "amount", "type": "int"},
+                ],
+                "rows": [
+                    {"oid": 1, "grp": "A", "amount": 5},
+                    {"oid": 2, "grp": "A", "amount": 2},
+                    {"oid": 3, "grp": "A", "amount": -2},
+                    {"oid": 4, "grp": "B", "amount": 5},
+                    {"oid": 6, "grp": None, "amount": 2},
+                    {"oid": 7, "grp": None, "amount": 3},
+                ],
+            }
+        ],
+        "plan": {
+            "type": "project",
+            "columns": [{"from": "total", "as": "total"}],
+            "input": {
+                "type": "aggregate",
+                "input": {"type": "scan", "table": "orders"},
+                "group_by": ["grp"],
+                "aggregates": [{"fn": "sum", "column": "amount", "as": "total"}],
+            },
+        },
+        "explain": {"row": {"total": 5}},
+    }
+    r = client.post("/query", json=req)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["result"]["row_count"] == 1
+    cf = body["counterfactual"]
+    assert cf["minimal_deletion_count"] == 6
+    assert cf["minimal_deletion_sets"] == [
+        ["orders[1]", "orders[4]", "orders[6]"],
+        ["orders[1]", "orders[4]", "orders[7]"],
+        ["orders[2]", "orders[4]", "orders[6]"],
+        ["orders[2]", "orders[4]", "orders[7]"],
+        ["orders[3]", "orders[4]", "orders[6]"],
+        ["orders[3]", "orders[4]", "orders[7]"],
+    ]
+    for sc in cf["scenarios"]:
+        assert sc["target_present"] is False
+
+
+def test_visible_group_key_after_project_still_hitting_sets(client):
+    """When the projection keeps the group key, groups never merge and the
+    ordinary single-group paths are unchanged: explaining group A returns its
+    three singleton mixed-sign deletion sets."""
+    req = {
+        "idempotency_key": "key-visible-key-project",
+        "tables": [
+            {
+                "table": "orders",
+                "primary_key": ["oid"],
+                "columns": [
+                    {"name": "oid", "type": "int"},
+                    {"name": "grp", "type": "string"},
+                    {"name": "amount", "type": "int"},
+                ],
+                "rows": [
+                    {"oid": 1, "grp": "A", "amount": 5},
+                    {"oid": 2, "grp": "A", "amount": 2},
+                    {"oid": 3, "grp": "A", "amount": -2},
+                    {"oid": 4, "grp": "B", "amount": 5},
+                ],
+            }
+        ],
+        "plan": {
+            "type": "project",
+            "columns": ["grp", {"from": "total", "as": "total"}],
+            "input": {
+                "type": "aggregate",
+                "input": {"type": "scan", "table": "orders"},
+                "group_by": ["grp"],
+                "aggregates": [{"fn": "sum", "column": "amount", "as": "total"}],
+            },
+        },
+        "explain": {"row": {"grp": "A", "total": 5}},
+    }
+    r = client.post("/query", json=req)
+    assert r.status_code == 200, r.text
+    cf = r.json()["counterfactual"]
+    assert cf["minimal_deletion_sets"] == [
+        ["orders[1]"],
+        ["orders[2]"],
+        ["orders[3]"],
+    ]
+    by_delete = {tuple(sc["delete"]): sc for sc in cf["scenarios"]}
+    assert by_delete[("orders[2]",)]["result"]["rows"] == [
+        {"grp": "A", "total": 3},
+        {"grp": "B", "total": 5},
+    ]
+
+
 def test_error_response_is_canonical_and_cached(client):
     req = {
         "idempotency_key": "key-err-cached",

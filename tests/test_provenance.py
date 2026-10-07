@@ -660,6 +660,82 @@ def test_aggregate_sum_minimal_combos_value_compression():
     }
 
 
+def test_mixed_sign_sum_pool_projected_merged_groups():
+    """When the projection drops the group key, groups A=(5,2,-2) and B=(5)
+    merge into the single projected row total=5. The pool walk must locate
+    BOTH origin groups by pushing aggregate rows forward through the
+    projection: it covers all four labels (three active A rows + B's row),
+    even though the target group key is unrecoverable from the projected
+    data. Independent outsider groups are not part of the pool."""
+    tables = [
+        {
+            "table": "orders",
+            "primary_key": ["id"],
+            "columns": ["id", "grp", "v"],
+            "rows": [
+                {"id": 1, "grp": "A", "v": 5},
+                {"id": 2, "grp": "A", "v": 2},
+                {"id": 3, "grp": "A", "v": -2},
+                {"id": 4, "grp": "B", "v": 5},
+                # independent outsider group: same-sign, disjoint labels
+                {"id": 5, "grp": "C", "v": 9},
+                {"id": 6, "grp": "C", "v": 1},
+            ],
+        }
+    ]
+    plan = {
+        "type": "project",
+        "columns": [{"from": "total", "as": "total"}],
+        "input": {
+            "type": "aggregate",
+            "input": {"type": "scan", "table": "orders"},
+            "group_by": ["grp"],
+            "aggregates": [{"fn": "sum", "column": "v", "as": "total"}],
+        },
+    }
+    ev = make_evaluator(tables)
+    pool = ev.mixed_sign_sum_pool(plan, (5,))
+    assert pool is not None
+    assert pool.full == {L("orders", 1), L("orders", 2), L("orders", 3), L("orders", 4)}
+    assert pool.reduced == {
+        L("orders", 1), L("orders", 2), L("orders", 3), L("orders", 4)
+    }
+    # Every origin member is non-zero, so all four labels are active; the
+    # outsider group C stays out of every pool component.
+    assert pool.active_labels == {
+        L("orders", 1), L("orders", 2), L("orders", 3), L("orders", 4)
+    }
+    # Members are counted across the origin groups: 3 in A + 1 in B.
+    assert pool.group_member_count == 4
+    assert pool.active_member_count == 4
+
+    # Same-sign origins (B-like groups only) still take the hitting-set path.
+    tables_same = [
+        {
+            "table": "orders",
+            "primary_key": ["id"],
+            "columns": ["id", "grp", "v"],
+            "rows": [
+                {"id": 1, "grp": "A", "v": 5},
+                {"id": 2, "grp": "A", "v": 2},
+                {"id": 3, "grp": "B", "v": 7},
+            ],
+        }
+    ]
+    plan_same = {
+        "type": "project",
+        "columns": [{"from": "total", "as": "total"}],
+        "input": {
+            "type": "aggregate",
+            "input": {"type": "scan", "table": "orders"},
+            "group_by": ["grp"],
+            "aggregates": [{"fn": "sum", "column": "v", "as": "total"}],
+        },
+    }
+    ev_same = make_evaluator(tables_same)
+    assert ev_same.mixed_sign_sum_pool(plan_same, (7,)) is None
+
+
 def test_empty_aggregate_input():
     from app.errors import ApiError
 

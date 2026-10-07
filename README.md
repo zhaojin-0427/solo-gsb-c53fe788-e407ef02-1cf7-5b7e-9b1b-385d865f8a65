@@ -1303,6 +1303,140 @@ curl -s -X POST http://localhost:8000/query \
 把它们精确放回（见前面 `ledger[4]` 的双标签方案与 18 条独立零对的诚实
 422）——剪枝只跳过“无论如何都复现不了目标”的子树，不改变裁决结果。
 
+### 投影丢弃组键：多组归并为一行时的反事实漏报修复
+
+聚合先按 `grp` 分组求和，投影再把组键列去掉时，**不同分组的相同输出行会按集合
+语义归并成一行**，其见证是各组见证的并集。下例中 A 组金额 `5, 2, -2`（正负
+混合，`total=5`）、B 组金额 `5`（`total=5`），只投影 `total` 后两组归并成
+唯一一行 `{"total": 5}`，溯源是 `(orders[1]) ∨ (orders[4])`。
+
+旧实现无法从投影后的目标行反推出它来自哪个组（组键已被丢弃），精确重算搜索
+因此被放弃、**静默退回见证命中集**。命中集对非单调混合求和只是单调近似，只
+报告 `{orders[1], orders[4]}`；实际上把 A 组的 2 行或 -2 行与 B 组的行一起
+删除，重算整条计划后归并行同样消失：
+
+* `{orders[1], orders[4]}`：A 剩 `2,-2 → 0`，B 消失 → 结果 `total=0`；
+* `{orders[2], orders[4]}`：A 剩 `5,-2 → 3`，B 消失 → 结果 `total=3`；
+* `{orders[3], orders[4]}`：A 剩 `5,2 → 7`，B 消失 → 结果 `total=7`。
+
+修复后求值器不再从目标“反推组键”，而是把聚合产出的每一行沿过滤/投影链
+**前向模拟**：凡是投影结果等于目标行的聚合组都是该归并行的**来源组**（本例
+A、B 两组）。每个来源组各自做活跃/惰性成员判定与选择性惰性标签门，候选池取
+并集，然后由整计划重算按**完整投影结果**裁决。与任何来源组都没有共享来源
+标签的无关分组（普通扫描输入下组间标签必然不相交）永远不进候选池——即使它
+本身是一个 21 成员的混合组、单独就超过 20 标签上限，也不会对本目标误报
+422；只有经连接共享标签、可能随来源组一起被删除的耦合分组才会保守纳入。组键
+可见时分组不会归并，仍走原来的单组路径；NULL 组键自成一组，同样参与归并
+判定。
+
+请求体见 [`examples/projected_groups_total_5.json`](examples/projected_groups_total_5.json)，
+一键复现：
+
+```bash
+curl -s -X POST http://localhost:8000/query \
+  -H 'Content-Type: application/json' \
+  --data-binary @examples/projected_groups_total_5.json
+```
+
+或直接内联：
+
+```bash
+curl -s -X POST http://localhost:8000/query \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "idempotency_key": "projected-groups-total-5",
+  "tables": [
+    {"table": "orders", "primary_key": ["oid"],
+     "columns": [
+       {"name": "oid", "type": "int"},
+       {"name": "grp", "type": "string"},
+       {"name": "amount", "type": "int"}],
+     "rows": [
+       {"oid": 1, "grp": "A", "amount": 5},
+       {"oid": 2, "grp": "A", "amount": 2},
+       {"oid": 3, "grp": "A", "amount": -2},
+       {"oid": 4, "grp": "B", "amount": 5}
+     ]}
+  ],
+  "plan": {
+    "type": "project",
+    "columns": [{"from": "total", "as": "total"}],
+    "input": {
+      "type": "aggregate",
+      "input": {"type": "scan", "table": "orders"},
+      "group_by": ["grp"],
+      "aggregates": [{"fn": "sum", "column": "amount", "as": "total"}]
+    }
+  },
+  "explain": {"row": {"total": 5}}
+}'
+```
+
+实际响应（线上为单行紧凑 JSON；这里格式化）：
+
+```json
+{
+  "status": "ok",
+  "symbol_table": [
+    {"symbol": "s1", "source": "orders[1]"},
+    {"symbol": "s2", "source": "orders[4]"}
+  ],
+  "result": {
+    "columns": ["total"],
+    "row_count": 1,
+    "rows": [
+      {
+        "row": {"total": 5},
+        "witness_count": 2,
+        "minimal_witnesses": [
+          {"labels": ["orders[1]"], "symbols": ["s1"], "conjunction": "s1"},
+          {"labels": ["orders[4]"], "symbols": ["s2"], "conjunction": "s2"}
+        ],
+        "provenance": {
+          "dnf": "(s1) ∨ (s2)",
+          "dnf_structured": [["s1"], ["s2"]],
+          "labels_structured": [["orders[1]"], ["orders[4]"]]
+        }
+      }
+    ]
+  },
+  "counterfactual": {
+    "target_index": 0,
+    "target": {"total": 5},
+    "target_provenance": {
+      "dnf": "(s1) ∨ (s2)",
+      "dnf_structured": [["s1"], ["s2"]],
+      "labels_structured": [["orders[1]"], ["orders[4]"]]
+    },
+    "minimal_deletion_count": 3,
+    "minimal_deletion_sets": [
+      ["orders[1]", "orders[4]"],
+      ["orders[2]", "orders[4]"],
+      ["orders[3]", "orders[4]"]
+    ],
+    "scenarios": [
+      {"delete": ["orders[1]", "orders[4]"], "target_present": false,
+       "result": {"columns": ["total"], "row_count": 1,
+                  "rows": [{"total": 0}]}},
+      {"delete": ["orders[2]", "orders[4]"], "target_present": false,
+       "result": {"columns": ["total"], "row_count": 1,
+                  "rows": [{"total": 3}]}},
+      {"delete": ["orders[3]", "orders[4]"], "target_present": false,
+       "result": {"columns": ["total"], "row_count": 1,
+                  "rows": [{"total": 7}]}}
+    ]
+  }
+}
+```
+
+解读：归并行 `total=5` 的两条极小见证分别来自 A 组的 `orders[1]` 与 B 组的
+`orders[4]`，符号表不含 `orders[2]`/`orders[3]`（它们不属于任何极小求和
+组合），但它们仍是真实的反事实候选。三个按标签稳定排序的双行删除集都经过
+**删除后整计划重算**确认：重算结果分别是 `0`、`3`、`7`，归并目标行均消失
+（`target_present: false`）。只删 `orders[4]` 时 A 组的 `total=5` 仍在，只删
+A 组一行时 B 组的 `total=5` 仍在，故没有单例方案。组键保留在投影中时分组不
+归并，对 A 组的解释仍是原来的三个单例删除集 `orders[1..3]`，行为不变。
+
 ### 幂等重放逐字节一致
 
 ```bash
@@ -1353,7 +1487,12 @@ cmp a.json b.json && echo "byte-identical"   # byte-identical
   命中所有见证后，组键或某个聚合值必然改变。
 * 例外是 **含正负混合值的 `sum`**（非单调求和）：删除不属于任何极小组合的
   行也可能改变总和，且删除更多行可能让目标值重新出现，命中集刻画不再成立。
-  此时服务先对目标组做 **候选约简**（`sum` 的零值/NULL 行、`min/max` 的非
+  当聚合之上的 **投影丢弃了组键**、多个分组归并为同一输出行时，目标行不再
+  对应唯一分组：服务把聚合产出沿过滤/投影链 **前向模拟**，取所有投影结果等于
+  目标行的分组作为来源组，分别做候选约简与选择性惰性标签门后合并候选池，再按
+  完整投影结果整计划重算裁决（无关分组、即与来源组无共享来源标签的分组不进
+  候选池，既不漏报跨组双行删除集，也不会因无关大组误触发 422）。其余情形
+  服务先对目标组做 **候选约简**（`sum` 的零值/NULL 行、`min/max` 的非
   极值行、`count(col)` 的 NULL 行先移出候选池），再过一道 **选择性惰性
   标签门**：它完全基于见证结构与聚合值模拟（不做整计划重算），逐个判定
   “只支持惰性成员”的来源标签能否出现在某个极小删除集中——删除某活跃标签
