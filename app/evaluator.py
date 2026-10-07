@@ -45,26 +45,35 @@ Col = tuple[str, str | None]
 class RecomputePool:
     """Reduced candidate pool for recomputation-based deletion-set search.
 
+    When a projection merges several aggregate groups into one target row the
+    pool is the union of the per-contributing-group pools (see
+    ``mixed_sign_sum_pool``); the counts below then sum over every
+    contributing group.
+
     Attributes:
-      full:    every source label in the target group's member witnesses;
-      active_labels: labels appearing in at least one witness of an *active*
-               member (a member whose deletion can change one of the target
-               aggregate values). Labels in ``full - active_labels`` support
-               only inert members (e.g. zero-valued join pairs) and are the
-               candidates for reduction;
-      reduced: labels the exact search actually enumerates. It starts equal
-               to ``active_labels``; the selective inert-label gate
+      full:    every source label in the contributing groups' member
+               witnesses;
+      active_labels: labels occurring in at least one witness of an *active*
+               member of a MIXED-sign contributing group (a member whose
+               deletion can change one of that group's target aggregate
+               values). Labels supporting only inert members, or belonging
+               solely to monotone contributing groups, are candidates for
+               reduction (monotone groups enter ``reduced`` directly through
+               their minimal hitting sets);
+      reduced: labels the exact search actually enumerates. It starts as the
+               mixed groups' active labels; the selective inert-label gate
                (``Evaluator._selective_inert_widening``) adds back exactly
                those inert-only labels that can occur in an inclusion-minimal
                deletion set. Unlike the previous all-or-nothing dependency
-               gate it does NOT widen back to ``full``: padding zero
-               members that cannot sustain the target row on their own stay
-               reduced out, while the labels of the zero members that keep a
+               gate it does NOT widen back to ``full``: padding zero members
+               that cannot sustain the target row on their own stay reduced
+               out, while the labels of the zero members that keep a
                zero-valued target alive (the zero self-join pair case) are
                restored;
-      group_member_count: number of input rows in the target group;
-      active_member_count: number of those that can change at least one
-               aggregate value of the target output;
+      group_member_count: total number of input rows in the contributing
+               groups;
+      active_member_count: number of those (in mixed-sign groups) that can
+               change at least one target aggregate value;
       gate_candidates: number of active-label subsets examined by the
                selective gate (diagnostic for the structured budget error).
     """
@@ -692,34 +701,49 @@ class Evaluator:
 
     _AGG_FNS = {"count", "sum", "min", "max"}
 
-    # Sentinel for the project walk in mixed_sign_sum_pool: marks input
-    # columns the projection did not carry through.
-    _UNMAPPED = object()
-
     def mixed_sign_sum_pool(self, node: Any, target_data: tuple) -> "RecomputePool | None":
-        """Reduced candidate pool for the target row when its group has a
+        """Reduced candidate pool for the target row when its plan has a
         ``sum`` over mixed positive/negative values (a non-monotone sum).
 
         *node* is the plan root and *target_data* the target row aligned to
         its output schema. The walk descends through ``filter``/``project``
         nodes (which neither change row identity nor dependencies) to the
-        innermost ``aggregate`` producing the target. Returns ``None`` when:
+        innermost ``aggregate`` below the target.
+
+        Projection-merged targets
+        -------------------------
+        A project node (or a chain of filters and projects) can merge several
+        aggregate groups into one presented row: groups with distinct keys but
+        identical projected aggregate values become set-semantics duplicates
+        and their witness families are unioned. When the project drops the
+        group key, that key cannot be reverse-engineered from the target data,
+        and the merged witness family no longer characterises the target: in a
+        mixed-sign group, members outside every merged witness can still move
+        the group's value onto (or off) the target. Rather than giving up and
+        falling back to hitting sets, every aggregate group that **feeds the
+        presented target row** is traced by forward replay through the node
+        chain (same filter/project/merge semantics as evaluation), and the
+        candidate pool is the union of those contributing groups' reduced
+        pools. Groups merged away into other projected rows can never remove
+        the target on their own and are excluded, so unrelated padding groups
+        cannot inflate the pool or trigger a spurious 422.
+
+        Returns ``None`` when:
 
         * no ``sum`` aggregate is involved (count/min/max are exact through
           hitting sets), or
-        * the target group's sum values are all non-negative or all
-          non-positive (the sum then changes iff a minimal-combination row is
-          deleted, so hitting sets stay exact), or
+        * none of the contributing groups has mixed-sign sum values (the sum
+          then changes iff a minimal-combination row is deleted, so hitting
+          sets stay exact), or
         * the aggregate cannot be reached by the walk (e.g. a join above
           it), in which case the caller keeps the hitting-set answer.
 
-        Candidate reduction
-        -------------------
-        A source row that cannot change *any* aggregate value of the target
-        output can never belong to an inclusion-minimal deletion set for that
-        full output row, so its exclusive labels are excluded from the
-        returned pool. Per aggregate over the target group, an input member
-        is *inert* when:
+        Candidate reduction per contributing group
+        -------------------------------------------
+        A source row that cannot change *any* aggregate value of a group's
+        output can never belong to an inclusion-minimal deletion set killing
+        that group, so its exclusive labels are excluded from the provisional
+        pool. Per aggregate over the group, an input member is *inert* when:
 
         * ``count(*)``: never inert (each member changes the count);
         * ``count(col)``: its ``col`` value is NULL (NULLs are not counted);
@@ -728,41 +752,31 @@ class Evaluator:
         * ``min``/``max(col)``: its non-NULL value differs from the target
           extremum — removing it cannot move the extremum.
 
-        A member is *active* when it is non-inert for at least one aggregate.
-        The provisional reduced pool is the union of the active members'
-        witness labels (any label supporting only inert members is dropped
-        for now). That provisional reduction is exact when every group member
-        depends on its own source labels — scans, filters, and one-to-one
-        joins. It is NOT exact in general under joins, where one source label
-        can feed several members: deleting it may remove a +5 member and a -5
-        member together (net zero) while an inert member (e.g. a zero-valued
-        self-join pair) survives, keeping the target in place — the inert
-        member's labels then belong to a minimal deletion set after all.
-
-        Rather than widening back to the *full* member-label set on the first
-        non-killing active singleton (the previous all-or-nothing gate, which
-        inflated the pool past the cap on arbitrary many independent padding
-        members and produced false 422s), ``_selective_inert_widening``
-        decides per inert-only label whether it can actually occur in an
-        inclusion-minimal deletion set, purely from the witness families and
-        an aggregate simulation (no plan recomputation): a label is restored
-        only when some active-label subset removes every active member while
-        the surviving inert members alone still reproduce the full target
-        row, and the label is essential to hitting those survivors.
+        Mixed-sign groups additionally run the selective inert-label gate
+        (``_selective_inert_widening``) to restore inert-only labels that
+        shared-label joins can make essential. Monotone (non-mixed)
+        contributing groups contribute exactly the labels occurring in their
+        own minimal hitting sets: with monotone aggregates a group's output
+        disappears iff its witness family is hit, so no other of its labels
+        can occur in an inclusion-minimal deletion set (this still includes
+        the existence labels of, e.g., an all-zero group whose ``total=0``
+        row merges into the target).
         """
         # Walk filter/project nodes down to the aggregate producing the
-        # target, remembering the node chain for schema lookups.
-        agg_node = node
+        # target, recording the chain (root ... aggregate) for forward replay.
+        chain: list[dict] = []
+        cur = node
         while True:
-            t = agg_node.get("type") if isinstance(agg_node, dict) else None
-            if t == "filter":
-                agg_node = self._input(agg_node)
-            elif t == "project":
-                agg_node = self._input(agg_node)
+            t = cur.get("type") if isinstance(cur, dict) else None
+            if t == "filter" or t == "project":
+                chain.append(cur)
+                cur = self._input(cur)
             elif t == "aggregate":
+                chain.append(cur)
                 break
             else:
                 return None
+        agg_node = chain[-1]
 
         gb = agg_node.get("group_by", [])
         aggs = self._agg_spec(agg_node)
@@ -770,141 +784,200 @@ class Evaluator:
         if not sum_cols:
             return None
         out_schema = self._agg_schema(agg_node)
-        # Take the target aggregate values from the produced row matching the
-        # target group key rather than from the possibly projected
-        # target_data: project walks can leave columns unmapped.
         in_names = self.schema(self._input(agg_node))
         key_idx = [in_names.index(g) for g in gb]
-        agg_rows = self.eval(agg_node)
-        agg_idx = {r["data"][:len(gb)]: r for r in agg_rows}
+        src_rows = self.eval(self._input(agg_node))
 
-        # Recover the group key from the (projected) target data by walking
-        # the node chain in reverse; unmapped group keys abort the path.
-        data = tuple(target_data)
-        walk = node
-        while walk is not agg_node:
-            t = walk.get("type")
-            if t == "filter":
-                walk = self._input(walk)
-            elif t == "project":
-                spec = self._proj_cols(walk)
-                out_values = dict(zip([a for _, a in spec], data))
-                inn = self.schema(self._input(walk))
-                mapped = {name: self._UNMAPPED for name in inn}
-                for frm, asname in spec:
-                    mapped[frm] = out_values[asname]
-                data = tuple(mapped[name] for name in inn)
-                walk = self._input(walk)
-        values = dict(zip(out_schema, data))
-        key = tuple(values[g] for g in gb)
-        if any(v is self._UNMAPPED for v in key):
-            return None
-        target_agg = agg_idx.get(key)
-        if target_agg is None:
-            return None
-        target_values = dict(zip(out_schema, target_agg["data"]))
-
-        gi = key_idx
-        members = [
-            r
-            for r in self.eval(self._input(agg_node))
-            if tuple(r["data"][i] for i in gi) == key
-        ]
-        mixed = False
-        for col in sum_cols:
-            ci = in_names.index(col)
-            vals = [r["data"][ci] for r in members if r["data"][ci] is not None]
-            if any(v > 0 for v in vals) and any(v < 0 for v in vals):
-                mixed = True
-                break
-        if not mixed:
+        # Forward replay: every aggregate group whose projected/filtered row
+        # merges into the presented target contributes sources to the pool.
+        contributing = self._trace_contributing_groups(
+            chain, tuple(target_data)
+        )
+        if not contributing:
             return None
 
-        # Target aggregate values, aligned to the spec: all-NULL sums/mins
-        # are None. A member is active iff deleting it can change at least
-        # one target aggregate value (see the class docstring).
-        active = [False] * len(members)
-        for fn, col, asname in aggs:
-            target = target_values[asname]
-            if fn == "count":
-                if col is None or col == "*":
-                    for i in range(len(members)):
-                        active[i] = True
-                else:
-                    ci = in_names.index(col)
-                    for i, m in enumerate(members):
-                        if m["data"][ci] is not None:
-                            active[i] = True
-            elif fn == "sum":
-                ci = in_names.index(col)
-                for i, m in enumerate(members):
-                    v = m["data"][ci]
-                    if v is not None and v != 0:
-                        active[i] = True
-            else:  # min / max
-                ci = in_names.index(col)
-                for i, m in enumerate(members):
-                    v = m["data"][ci]
-                    if v is not None and target is not None and v == target:
-                        active[i] = True
+        from .provenance import MAX_RECOMPUTE_POOL, minimal_hitting_sets
 
         full_pool: set[Label] = set()
         reduced_pool: set[Label] = set()
-        active_members: list[dict] = []
-        inert_members: list[dict] = []
-        for i, r in enumerate(members):
-            member_labels: set[Label] = set()
-            for w in r["witnesses"]:
-                member_labels.update(w)
-            full_pool.update(member_labels)
-            if active[i]:
-                reduced_pool.update(member_labels)
-                active_members.append(r)
-            else:
-                inert_members.append(r)
+        active_pool: set[Label] = set()
+        group_member_count = 0
+        active_member_count = 0
+        gate_candidates = 0
+        any_mixed = False
 
-        # Defensive: an empty active pool would mean no active label at all,
-        # but a mixed-sign sum guarantees non-zero members exist; leave the
-        # exact-path decision to the caller rather than searching nothing.
+        for target_agg in contributing:
+            key = target_agg["data"][:len(gb)]
+            target_values = dict(zip(out_schema, target_agg["data"]))
+            members = [
+                r
+                for r in src_rows
+                if tuple(r["data"][i] for i in key_idx) == key
+            ]
+
+            member_labels: set[Label] = set()
+            for m in members:
+                for w in m["witnesses"]:
+                    member_labels.update(w)
+            full_pool.update(member_labels)
+            group_member_count += len(members)
+
+            mixed = False
+            for col in sum_cols:
+                ci = in_names.index(col)
+                vals = [r["data"][ci] for r in members if r["data"][ci] is not None]
+                if any(v > 0 for v in vals) and any(v < 0 for v in vals):
+                    mixed = True
+                    break
+
+            # Per-aggregate activity flags (a member is active when deleting
+            # it can change at least one target aggregate value).
+            active = [False] * len(members)
+            for fn, col, asname in aggs:
+                if fn == "count":
+                    if col is None or col == "*":
+                        for i in range(len(members)):
+                            active[i] = True
+                    else:
+                        ci = in_names.index(col)
+                        for i, m in enumerate(members):
+                            if m["data"][ci] is not None:
+                                active[i] = True
+                elif fn == "sum":
+                    ci = in_names.index(col)
+                    for i, m in enumerate(members):
+                        v = m["data"][ci]
+                        if v is not None and v != 0:
+                            active[i] = True
+                else:  # min / max
+                    ci = in_names.index(col)
+                    target = target_values[asname]
+                    for i, m in enumerate(members):
+                        v = m["data"][ci]
+                        if v is not None and target is not None and v == target:
+                            active[i] = True
+
+            active_labels: set[Label] = set()
+            active_members: list[dict] = []
+            inert_members: list[dict] = []
+            for i, m in enumerate(members):
+                labels: set[Label] = set()
+                for w in m["witnesses"]:
+                    labels.update(w)
+                if active[i]:
+                    active_labels.update(labels)
+                    active_members.append(m)
+                else:
+                    inert_members.append(m)
+            active_member_count += len(active_members)
+
+            if not mixed:
+                # Monotone group: it is killed exactly when its output row's
+                # witness family is hit. Only labels occurring in some
+                # inclusion-minimal hitting set can ever be essential (an
+                # all-zero total=0 group is still covered via its existence
+                # witnesses).
+                for hs in minimal_hitting_sets(target_agg["witnesses"]):
+                    reduced_pool.update(hs)
+                continue
+
+            any_mixed = True
+            active_pool.update(active_labels)
+            if not active_labels:
+                # Defensive: a mixed-sign sum guarantees non-zero members.
+                continue
+
+            # When even this group's active-only pool exceeds the enumeration
+            # cap the gate cannot shrink it; take the active labels and let
+            # the union-sized pool raise the structured error upstream.
+            if len(active_labels) > MAX_RECOMPUTE_POOL:
+                reduced_pool.update(active_labels)
+                continue
+
+            widened, examined = self._selective_inert_widening(
+                aggs=aggs,
+                in_names=in_names,
+                target_values=target_values,
+                active_members=active_members,
+                inert_members=inert_members,
+                active_pool=active_labels,
+                full_pool=member_labels,
+            )
+            reduced_pool.update(widened)
+            gate_candidates += examined
+
+        if not any_mixed:
+            return None
         if not reduced_pool:
             return None
 
-        # When even the active-only pool exceeds the enumeration cap the gate
-        # cannot shrink it, so skip the structural analysis; the caller raises
-        # the structured pool-too-large error.
-        from .provenance import MAX_RECOMPUTE_POOL
-
-        if len(reduced_pool) > MAX_RECOMPUTE_POOL:
-            return RecomputePool(
-                full=full_pool,
-                reduced=set(reduced_pool),
-                group_member_count=len(members),
-                active_member_count=len(active_members),
-                active_labels=set(reduced_pool),
-                gate_candidates=0,
-            )
-
-        # Selective inert-label gate: restore exactly the inert-only labels
-        # that can participate in an inclusion-minimal deletion set. The
-        # provisional active-only pool is enumerated over at most 20 labels,
-        # so the structural analysis over it is bounded.
-        widened, examined = self._selective_inert_widening(
-            aggs=aggs,
-            in_names=in_names,
-            target_values=target_values,
-            active_members=active_members,
-            inert_members=inert_members,
-            active_pool=reduced_pool,
-            full_pool=full_pool,
-        )
         return RecomputePool(
             full=full_pool,
-            reduced=widened,
-            group_member_count=len(members),
-            active_member_count=len(active_members),
-            active_labels=set(reduced_pool),
-            gate_candidates=examined,
+            reduced=reduced_pool,
+            group_member_count=group_member_count,
+            active_member_count=active_member_count,
+            active_labels=active_pool,
+            gate_candidates=gate_candidates,
         )
+
+    def _trace_contributing_groups(
+        self, chain: list[dict], target_data: tuple
+    ) -> list[dict]:
+        """Aggregate output rows that feed the presented *target_data* row.
+
+        *chain* runs root-first down to the aggregate node. Each aggregate
+        row is replayed upward through every filter/project node; rows that
+        survive the filters and (possibly) merge under projection into a row
+        equal to *target_data* are contributing groups. Forward replay is
+        essential when the projection drops group keys: the contributing
+        groups cannot be recovered from the target tuple backwards.
+        """
+        agg_node = chain[-1]
+        contributing: list[dict] = []
+        for agg_row in self.eval(agg_node):
+            rows = [agg_row]
+            child = agg_node
+            for step in reversed(chain[:-1]):
+                rows = self._replay_upward(step, child, rows)
+                if not rows:
+                    break
+                child = step
+            if rows and any(r["data"] == target_data for r in rows):
+                contributing.append(agg_row)
+        return contributing
+
+    def _replay_upward(
+        self, step: dict, child_node: dict, rows: list[dict]
+    ) -> list[dict]:
+        """Replay labeled *rows* from the child relation through one
+        filter/project node, using the same semantics as normal evaluation
+        (predicates use 3-valued logic; projections merge set duplicates and
+        union their witness families)."""
+        t = step.get("type")
+        if t == "filter":
+            names = self.schema(child_node)
+            out = []
+            for r in rows:
+                keep = eval_predicate(step["predicate"], dict(zip(names, r["data"])))
+                if keep is True:
+                    out.append(r)
+            out.sort(key=lambda r: tuple_sort_key(r["data"]))
+            return out
+        if t == "project":
+            spec = self._proj_cols(step)
+            names = self.schema(child_node)
+            produced = []
+            for r in rows:
+                produced.append(
+                    {
+                        "data": tuple(
+                            r["data"][names.index(frm)] for frm, _ in spec
+                        ),
+                        "witnesses": set(r["witnesses"]),
+                    }
+                )
+            return merge_relation(produced)
+        raise ApiError("MALFORMED_PLAN", f"unexpected chain node type {t!r}")
 
     # -- selective inert-label widening (exact structural gate) -------------
 

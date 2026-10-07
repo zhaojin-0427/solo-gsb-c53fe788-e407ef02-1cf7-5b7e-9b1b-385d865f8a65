@@ -506,6 +506,80 @@ def test_mixed_sign_sum_pool_self_join_selective_gate_keeps_zero_pair():
     assert pool.active_member_count == 2
 
 
+def test_mixed_sign_sum_pool_projected_merge_union_of_contributing_groups():
+    """Group A (5, 2, -2) and group B (5) both aggregate to total=5 and merge
+    when only total is projected. The pool must be the union of the
+    contributing groups' reduced pools — all four labels — while a third
+    unrelated group (total=9) is traced out and contributes no labels."""
+    tables = [
+        {
+            "table": "ledger",
+            "primary_key": ["id"],
+            "columns": ["id", "grp", "amount"],
+            "rows": [
+                {"id": 1, "grp": "A", "amount": 5},
+                {"id": 2, "grp": "A", "amount": 2},
+                {"id": 3, "grp": "A", "amount": -2},
+                {"id": 4, "grp": "B", "amount": 5},
+                {"id": 5, "grp": "C", "amount": 9},
+            ],
+        }
+    ]
+    plan = {
+        "type": "project",
+        "columns": [{"from": "total", "as": "total"}],
+        "input": {
+            "type": "aggregate",
+            "input": {"type": "scan", "table": "ledger"},
+            "group_by": ["grp"],
+            "aggregates": [{"fn": "sum", "column": "amount", "as": "total"}],
+        },
+    }
+    ev = make_evaluator(tables)
+    pool = ev.mixed_sign_sum_pool(plan, (5,))
+    assert pool is not None
+    assert pool.full == {
+        L("ledger", 1), L("ledger", 2), L("ledger", 3), L("ledger", 4)
+    }
+    # A has three active members, B one; C is not a contributing group.
+    assert pool.group_member_count == 4
+    assert pool.active_member_count == 4
+    # The monotone B group contributes its hitting-set label ledger[4]; the
+    # mixed A group contributes all three non-zero member labels.
+    assert pool.reduced == {
+        L("ledger", 1), L("ledger", 2), L("ledger", 3), L("ledger", 4)
+    }
+
+
+def test_mixed_sign_sum_pool_projected_merge_all_monotone_returns_none():
+    """When every group feeding the projected target is monotone (same-sign),
+    hitting sets stay exact and the recompute path is not taken."""
+    tables = [
+        {
+            "table": "ledger",
+            "primary_key": ["id"],
+            "columns": ["id", "grp", "amount"],
+            "rows": [
+                {"id": 1, "grp": "A", "amount": 3},
+                {"id": 2, "grp": "A", "amount": 2},
+                {"id": 3, "grp": "B", "amount": 5},
+            ],
+        }
+    ]
+    plan = {
+        "type": "project",
+        "columns": [{"from": "total", "as": "total"}],
+        "input": {
+            "type": "aggregate",
+            "input": {"type": "scan", "table": "ledger"},
+            "group_by": ["grp"],
+            "aggregates": [{"fn": "sum", "column": "amount", "as": "total"}],
+        },
+    }
+    ev = make_evaluator(tables)
+    assert ev.mixed_sign_sum_pool(plan, (5,)) is None
+
+
 def test_mixed_sign_sum_pool_shared_left_prunes_dependent_inert():
     """Self-join where every member shares the left source row: 19 non-zero
     members (ten +9, nine -10) plus two zero members, all with row 1 in

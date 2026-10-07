@@ -659,6 +659,147 @@ curl -s -X POST http://localhost:8000/query \
 整计划重算）。上例 21 个成员全部活跃，候选池在进门前就超过上限，因此
 `selective_gate_candidates` 为 `0`。
 
+#### 投影丢弃组键后合并行的反事实（按完整投影结果裁决）
+
+分组聚合之后再投影、且投影**不保留组键**时，不同组若聚合值相同，会按
+集合语义合并成同一行输出。此时目标行的见证只是各组见证的并，**无法从
+目标行反推出组键**；若其中某组是异号求和（非单调），单纯对合并见证取
+命中集会漏报删除方案。
+
+下例中组 `A` 三行金额为 `5, 2, -2`（合计 `5`），组 `B` 一行金额为 `5`；
+按 `grp` 分组求和后只投影 `total`，两行 `total=5` 合并为一行，合并见证为
+`(s1) ∨ (s2)`（即 `ledger[1]`、`ledger[4]`）。旧逻辑无法从目标反推组键，
+退回见证命中只报告 `{ledger[1], ledger[4]}` 一组；但整计划重算表明，
+删 `{ledger[2], ledger[4]}` 后 A 组变 `3`、B 组消失，删
+`{ledger[3], ledger[4]}` 后 A 组变 `7`、B 组消失 —— 目标行同样消失。
+
+服务的处理方式：
+
+1. **正向重放确定贡献组**：从聚合输出的每个组出发，沿 `filter` /
+   `project` 链向上重放（谓词用同一套三值逻辑，投影用与执行器相同的
+   合并/并见证语义），凡最终并入所指目标投影行的聚合组都作为候选来源；
+   并入其他投影行（如另一个 `total=9`、`total=0`）的组不是贡献组。
+2. **按组选定候选范围**：任一贡献组含异号 `sum` 即走精确重算搜索；
+   候选池是各贡献组约简池的并——异号组经候选约简与选择性惰性标签门，
+   单调组只取自身极小命中集中出现的标签（例如全零且 `total=0` 的组仍经
+   “组存在”见证进入）。**无关组一律不进池**：再多无关行（二十行
+   `1` 的 C 组等）也不会把池撑过 20 标签上限、不会误触发 422。
+3. **按完整投影结果裁决**：每个候选删除集都在删除后的快照上重算整条
+   计划，以投影结果中是否仍存在与目标完全相等的行判定目标是否消失；
+   聚合输入被删空导致 `EMPTY_AGGREGATE` 同样计为目标消失。
+
+组键可见（不投影掉 `grp`）时的结果、NULL 组键、以及幂等重放均保持不变；
+只有贡献组约简池的并真正超过预算时才返回结构化 422，绝不输出近似方案。
+
+请求（也保存在 [`examples/projected_merged_total_5.json`](examples/projected_merged_total_5.json)）：
+
+```bash
+curl -s -X POST http://localhost:8000/query \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "idempotency_key": "projected-merged-total-5",
+  "tables": [
+    {"table": "ledger", "primary_key": ["oid"],
+     "columns": [
+       {"name":"oid","type":"int"},
+       {"name":"grp","type":"string"},
+       {"name":"amount","type":"int"}
+     ],
+     "rows": [
+       {"oid":1,"grp":"A","amount":5},
+       {"oid":2,"grp":"A","amount":2},
+       {"oid":3,"grp":"A","amount":-2},
+       {"oid":4,"grp":"B","amount":5}
+     ]}
+  ],
+  "plan": {
+    "type": "project",
+    "columns": [{"from":"total","as":"total"}],
+    "input": {
+      "type": "aggregate",
+      "input": {"type":"scan","table":"ledger"},
+      "group_by": ["grp"],
+      "aggregates": [{"fn":"sum","column":"amount","as":"total"}]
+    }
+  },
+  "explain": {"row": {"total": 5}}
+}'
+```
+
+实际响应（线上传输为单行紧凑 JSON；这里为可读性格式化）：
+
+```json
+{
+  "status": "ok",
+  "symbol_table": [
+    {"symbol": "s1", "source": "ledger[1]"},
+    {"symbol": "s2", "source": "ledger[4]"}
+  ],
+  "result": {
+    "columns": ["total"],
+    "row_count": 1,
+    "rows": [
+      {
+        "row": {"total": 5},
+        "witness_count": 2,
+        "minimal_witnesses": [
+          {"labels": ["ledger[1]"], "symbols": ["s1"], "conjunction": "s1"},
+          {"labels": ["ledger[4]"], "symbols": ["s2"], "conjunction": "s2"}
+        ],
+        "provenance": {
+          "dnf": "(s1) ∨ (s2)",
+          "dnf_structured": [["s1"], ["s2"]],
+          "labels_structured": [["ledger[1]"], ["ledger[4]"]]
+        }
+      }
+    ]
+  },
+  "counterfactual": {
+    "target_index": 0,
+    "target": {"total": 5},
+    "target_provenance": {
+      "dnf": "(s1) ∨ (s2)",
+      "dnf_structured": [["s1"], ["s2"]],
+      "labels_structured": [["ledger[1]"], ["ledger[4]"]]
+    },
+    "minimal_deletion_count": 3,
+    "minimal_deletion_sets": [
+      ["ledger[1]", "ledger[4]"],
+      ["ledger[2]", "ledger[4]"],
+      ["ledger[3]", "ledger[4]"]
+    ],
+    "scenarios": [
+      {
+        "delete": ["ledger[1]", "ledger[4]"],
+        "target_present": false,
+        "result": {"columns": ["total"], "row_count": 1,
+                   "rows": [{"total": 0}]}
+      },
+      {
+        "delete": ["ledger[2]", "ledger[4]"],
+        "target_present": false,
+        "result": {"columns": ["total"], "row_count": 1,
+                   "rows": [{"total": 3}]}
+      },
+      {
+        "delete": ["ledger[3]", "ledger[4]"],
+        "target_present": false,
+        "result": {"columns": ["total"], "row_count": 1,
+                   "rows": [{"total": 7}]}
+      }
+    ]
+  }
+}
+```
+
+解读：三个极小双行删除集按标签稳定排序（`[1,4] < [2,4] < [3,4]`）；
+每个场景的 `result` 都是删除后**整条计划重算**的完整投影结果，
+`target_present` 恒为 `false`。重放同一请求体得到逐字节相同的响应与
+`X-Idempotent-Replay: true`。若两个贡献组都是异号求和（例如 B 组金额为
+`5, 3, -3`、合计同样为 `5`），删除集就是两组单例的笛卡尔组合
+（3 × 3 = 9 个双行集），同样由整计划重算逐一裁决；贡献组全部单调时
+（如 A 组 `3+2=5`、B 组 `5`）仍直接对合并见证取命中集，行为不变。
+
 ### 连接求和的反事实：自连接零值成员不能按金额丢弃
 
 候选约简按“成员数值”判断惰性，这在扫描/一对一连接下是精确的；但同一个
@@ -1372,6 +1513,11 @@ cmp a.json b.json && echo "byte-identical"   # byte-identical
   未命中的删除集不剪枝其超集。候选池（约简 + 选择性门后）超过 20 行、或
   整计划重算超过 10 000 次时返回结构化错误
   `COUNTERFACTUAL_SEARCH_BUDGET_EXCEEDED`（HTTP 422），绝不回退为命中集
-  近似。无论走哪条路径，每个删除场景都会 **重算整条计划** 并显式给出
+  近似。聚合之上若有丢弃组键的投影，多个聚合组可能因聚合值相同而合并为
+  同一投影行；此时无法由目标行反推组键，服务会从聚合输出 **正向重放**
+  `filter`/`project` 链，把所有并入目标投影行的聚合组都作为贡献组：
+  只要其中有一组含异号 `sum`，候选池就是各贡献组约简池的并（单调组只取
+  其极小命中集标签），无关组不进池、不误触发 422，最终仍以删除后重算的
+  **完整投影结果** 裁决。无论走哪条路径，每个删除场景都会 **重算整条计划** 并显式给出
   `target_present`，以重算结果为准；删除后聚合输入为空时，场景返回结构化
   的 `recompute_error`（如 `EMPTY_AGGREGATE`）。

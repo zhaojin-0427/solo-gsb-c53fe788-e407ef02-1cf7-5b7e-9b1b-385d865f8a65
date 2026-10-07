@@ -231,6 +231,338 @@ def test_null_filter_3vl(client):
     assert [x["row"]["id"] for x in rows] == [3]
 
 
+def test_projected_group_key_merge_counterfactual(client):
+    """Regression for the projected-merged-target false negative.
+
+    Rows 1..3 form group A with amounts 5, 2, -2 (sum 5); row 4 forms group
+    B with amount 5. The aggregate groups on grp but the project keeps only
+    total, so both groups merge into the single presented row {"total": 5}.
+    The merged witness family is just (s1) ∨ (s4), so a witness-only engine
+    cannot reverse-engineer the dropped group keys and reports only the
+    witness hit {orders[1], orders[4]}. Recomputing the whole plan after
+    deleting {orders[2], orders[4]} (A -> 3) or {orders[3], orders[4]}
+    (A -> 7) also makes the target disappear: all three minimal two-row
+    deletion sets must be returned, stably label-sorted, with recomputed
+    scenarios.
+    """
+    req = {
+        "idempotency_key": "key-proj-merged-5",
+        "tables": [
+            {
+                "table": "ledger",
+                "primary_key": ["oid"],
+                "columns": [
+                    {"name": "oid", "type": "int"},
+                    {"name": "grp", "type": "string"},
+                    {"name": "amount", "type": "int"},
+                ],
+                "rows": [
+                    {"oid": 1, "grp": "A", "amount": 5},
+                    {"oid": 2, "grp": "A", "amount": 2},
+                    {"oid": 3, "grp": "A", "amount": -2},
+                    {"oid": 4, "grp": "B", "amount": 5},
+                ],
+            }
+        ],
+        "plan": {
+            "type": "project",
+            "columns": [{"from": "total", "as": "total"}],
+            "input": {
+                "type": "aggregate",
+                "input": {"type": "scan", "table": "ledger"},
+                "group_by": ["grp"],
+                "aggregates": [
+                    {"fn": "sum", "column": "amount", "as": "total"}
+                ],
+            },
+        },
+        "explain": {"row": {"total": 5}},
+    }
+    r1 = client.post("/query", json=req)
+    assert r1.status_code == 200, r1.text
+    body = r1.json()
+    # The presented result is one merged row whose witnesses are the two
+    # singleton groups that minimally produce total=5.
+    assert body["result"]["row_count"] == 1
+    target = body["result"]["rows"][0]
+    assert target["row"] == {"total": 5}
+    assert target["provenance"]["labels_structured"] == [
+        ["ledger[1]"],
+        ["ledger[4]"],
+    ]
+    cf = body["counterfactual"]
+    assert cf["target"] == {"total": 5}
+    assert cf["target_index"] == 0
+    assert cf["minimal_deletion_count"] == 3
+    # Stable label-tuple order: [1,4] < [2,4] < [3,4].
+    assert cf["minimal_deletion_sets"] == [
+        ["ledger[1]", "ledger[4]"],
+        ["ledger[2]", "ledger[4]"],
+        ["ledger[3]", "ledger[4]"],
+    ]
+    by_delete = {tuple(sc["delete"]): sc for sc in cf["scenarios"]}
+    assert by_delete[("ledger[1]", "ledger[4]")]["result"]["rows"] == [
+        {"total": 0}
+    ]
+    assert by_delete[("ledger[2]", "ledger[4]")]["result"]["rows"] == [
+        {"total": 3}
+    ]
+    assert by_delete[("ledger[3]", "ledger[4]")]["result"]["rows"] == [
+        {"total": 7}
+    ]
+    for sc in cf["scenarios"]:
+        assert sc["target_present"] is False
+        assert sc["result"]["row_count"] == 1
+    # Idempotent replay stays byte-identical.
+    r2 = client.post("/query", json=req)
+    assert r2.status_code == 200
+    assert r1.content == r2.content
+    assert r2.headers["x-idempotent-replay"] == "true"
+
+
+def test_projected_merge_unrelated_group_not_422(client):
+    """Groups merged into OTHER projected rows must not enter the candidate
+    pool: twenty extra positive rows in an unrelated group (total 20, not 5)
+    neither produce extra deletion sets nor inflate the pool past the cap —
+    the three minimal pairs are still answered with 200."""
+    req = {
+        "idempotency_key": "key-proj-merged-unrelated",
+        "tables": [
+            {
+                "table": "ledger",
+                "primary_key": ["oid"],
+                "columns": [
+                    {"name": "oid", "type": "int"},
+                    {"name": "grp", "type": "string"},
+                    {"name": "amount", "type": "int"},
+                ],
+                "rows": [
+                    {"oid": 1, "grp": "A", "amount": 5},
+                    {"oid": 2, "grp": "A", "amount": 2},
+                    {"oid": 3, "grp": "A", "amount": -2},
+                    {"oid": 4, "grp": "B", "amount": 5},
+                ]
+                + [{"oid": oid, "grp": "C", "amount": 1} for oid in range(5, 25)],
+            }
+        ],
+        "plan": {
+            "type": "project",
+            "columns": [{"from": "total", "as": "total"}],
+            "input": {
+                "type": "aggregate",
+                "input": {"type": "scan", "table": "ledger"},
+                "group_by": ["grp"],
+                "aggregates": [
+                    {"fn": "sum", "column": "amount", "as": "total"}
+                ],
+            },
+        },
+        "explain": {"row": {"total": 5}},
+    }
+    r = client.post("/query", json=req)
+    assert r.status_code == 200, r.text
+    cf = r.json()["counterfactual"]
+    assert cf["minimal_deletion_sets"] == [
+        ["ledger[1]", "ledger[4]"],
+        ["ledger[2]", "ledger[4]"],
+        ["ledger[3]", "ledger[4]"],
+    ]
+
+
+def test_projected_merge_null_group_key_counterfactual(client):
+    """NULL group keys form their own group; after the key is projected away
+    a NULL-keyed mixed group still merges correctly and its candidates are
+    traced by forward replay."""
+    req = {
+        "idempotency_key": "key-proj-merged-null-key",
+        "tables": [
+            {
+                "table": "t",
+                "primary_key": ["id"],
+                "columns": ["id", "g", "v"],
+                "rows": [
+                    {"id": 1, "g": None, "v": 5},
+                    {"id": 2, "g": None, "v": 2},
+                    {"id": 3, "g": None, "v": -2},
+                    {"id": 4, "g": "B", "v": 5},
+                ],
+            }
+        ],
+        "plan": {
+            "type": "project",
+            "columns": [{"from": "total", "as": "total"}],
+            "input": {
+                "type": "aggregate",
+                "input": {"type": "scan", "table": "t"},
+                "group_by": ["g"],
+                "aggregates": [{"fn": "sum", "column": "v", "as": "total"}],
+            },
+        },
+        "explain": {"row": {"total": 5}},
+    }
+    r = client.post("/query", json=req)
+    assert r.status_code == 200, r.text
+    cf = r.json()["counterfactual"]
+    assert cf["minimal_deletion_sets"] == [
+        ["t[1]", "t[4]"],
+        ["t[2]", "t[4]"],
+        ["t[3]", "t[4]"],
+    ]
+
+
+def test_projected_merge_both_groups_mixed_counterfactual(client):
+    """When BOTH merged groups have mixed signs, killing the merged target
+    requires moving each contributing group off total=5: every A-side
+    singleton (5/2/-2) paired with every B-side singleton (5/3/-3) gives
+    nine minimal pairs, decided by full-plan recomputation."""
+    req = {
+        "idempotency_key": "key-proj-merged-both-mixed",
+        "tables": [
+            {
+                "table": "ledger",
+                "primary_key": ["oid"],
+                "columns": [
+                    {"name": "oid", "type": "int"},
+                    {"name": "grp", "type": "string"},
+                    {"name": "amount", "type": "int"},
+                ],
+                "rows": [
+                    {"oid": 1, "grp": "A", "amount": 5},
+                    {"oid": 2, "grp": "A", "amount": 2},
+                    {"oid": 3, "grp": "A", "amount": -2},
+                    {"oid": 4, "grp": "B", "amount": 5},
+                    {"oid": 5, "grp": "B", "amount": 3},
+                    {"oid": 6, "grp": "B", "amount": -3},
+                ],
+            }
+        ],
+        "plan": {
+            "type": "project",
+            "columns": [{"from": "total", "as": "total"}],
+            "input": {
+                "type": "aggregate",
+                "input": {"type": "scan", "table": "ledger"},
+                "group_by": ["grp"],
+                "aggregates": [
+                    {"fn": "sum", "column": "amount", "as": "total"}
+                ],
+            },
+        },
+        "explain": {"row": {"total": 5}},
+    }
+    r = client.post("/query", json=req)
+    assert r.status_code == 200, r.text
+    cf = r.json()["counterfactual"]
+    expected = [
+        [f"ledger[{a}]", f"ledger[{b}]"]
+        for a in (1, 2, 3)
+        for b in (4, 5, 6)
+    ]
+    assert cf["minimal_deletion_sets"] == expected
+    by_delete = {tuple(sc["delete"]): sc for sc in cf["scenarios"]}
+    assert by_delete[("ledger[2]", "ledger[5]")]["result"]["rows"] == [
+        {"total": 2},
+        {"total": 3},
+    ]
+    for sc in cf["scenarios"]:
+        assert sc["target_present"] is False
+
+
+def test_projected_merge_monotone_groups_keep_hitting_sets(client):
+    """Projection-merged targets with NO mixed-sign group keep exact hitting
+    sets: A = 3+2 = 5 (witness s1∧s2), B = 5 (witness s3); the merged row's
+    minimal transversals are {s1,s3} and {s2,s3}."""
+    req = {
+        "idempotency_key": "key-proj-merged-monotone",
+        "tables": [
+            {
+                "table": "ledger",
+                "primary_key": ["oid"],
+                "columns": ["oid", "grp", "amount"],
+                "rows": [
+                    {"oid": 1, "grp": "A", "amount": 3},
+                    {"oid": 2, "grp": "A", "amount": 2},
+                    {"oid": 3, "grp": "B", "amount": 5},
+                ],
+            }
+        ],
+        "plan": {
+            "type": "project",
+            "columns": [{"from": "total", "as": "total"}],
+            "input": {
+                "type": "aggregate",
+                "input": {"type": "scan", "table": "ledger"},
+                "group_by": ["grp"],
+                "aggregates": [
+                    {"fn": "sum", "column": "amount", "as": "total"}
+                ],
+            },
+        },
+        "explain": {"row": {"total": 5}},
+    }
+    r = client.post("/query", json=req)
+    assert r.status_code == 200, r.text
+    cf = r.json()["counterfactual"]
+    assert cf["minimal_deletion_sets"] == [
+        ["ledger[1]", "ledger[3]"],
+        ["ledger[2]", "ledger[3]"],
+    ]
+
+
+def test_projected_merge_actual_budget_exhaustion_still_422(client):
+    """Two genuinely mixed contributing groups (19 + 2 active labels) merge
+    into total=5: the 21-label union really exhausts the pool cap, so the
+    structured 422 is still returned — unrelated positive padding in group C
+    is excluded and does not change the counts."""
+    rows = [{"oid": 1, "grp": "A", "amount": 5}]
+    rows += [{"oid": i, "grp": "A", "amount": 1} for i in range(2, 11)]
+    rows += [{"oid": i, "grp": "A", "amount": -1} for i in range(11, 20)]
+    rows += [
+        {"oid": 20, "grp": "B", "amount": 7},
+        {"oid": 21, "grp": "B", "amount": -2},
+    ]
+    rows += [{"oid": i, "grp": "C", "amount": 9} for i in range(22, 30)]
+    req = {
+        "idempotency_key": "key-proj-merged-422",
+        "tables": [
+            {
+                "table": "ledger",
+                "primary_key": ["oid"],
+                "columns": [
+                    {"name": "oid", "type": "int"},
+                    {"name": "grp", "type": "string"},
+                    {"name": "amount", "type": "int"},
+                ],
+                "rows": rows,
+            }
+        ],
+        "plan": {
+            "type": "project",
+            "columns": [{"from": "total", "as": "total"}],
+            "input": {
+                "type": "aggregate",
+                "input": {"type": "scan", "table": "ledger"},
+                "group_by": ["grp"],
+                "aggregates": [
+                    {"fn": "sum", "column": "amount", "as": "total"}
+                ],
+            },
+        },
+        "explain": {"row": {"total": 5}},
+    }
+    r1 = client.post("/query", json=req)
+    assert r1.status_code == 422, r1.text
+    err = r1.json()["error"]
+    assert err["code"] == "COUNTERFACTUAL_SEARCH_BUDGET_EXCEEDED"
+    assert err["details"]["reduced_pool_size"] == 21
+    assert err["details"]["pool_limit"] == 20
+    assert "counterfactual" not in r1.json()
+    r2 = client.post("/query", json=req)
+    assert r2.status_code == 422
+    assert r1.content == r2.content
+    assert r2.headers["x-idempotent-replay"] == "true"
+
+
 def test_aggregate_counterfactual_group_deletion(client):
     req = {
         "idempotency_key": "key-agg-cf",
